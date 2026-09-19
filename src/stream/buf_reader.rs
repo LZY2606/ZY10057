@@ -939,3 +939,167 @@ mod tests_sync {
         assert_eq!(read.buffer(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
     }
 }
+
+#[cfg(test)]
+mod tests_deterministic_async {
+    use super::{BufReader, Bufferless, CombineBuffer};
+    use bytes::BufMut;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    };
+    use tokio_dep::io::AsyncRead as _;
+
+    #[derive(Default)]
+    struct ScriptedRead {
+        ops: std::collections::VecDeque<ScriptedOp>,
+        calls: usize,
+    }
+
+    enum ScriptedOp {
+        Pending,
+        Ready(Vec<u8>),
+        Error(io::ErrorKind),
+        Eof,
+    }
+
+    impl tokio_dep::io::AsyncRead for ScriptedRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio_dep::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.calls += 1;
+            match this.ops.pop_front().unwrap_or(ScriptedOp::Eof) {
+                ScriptedOp::Pending => Poll::Pending,
+                ScriptedOp::Ready(bytes) => {
+                    buf.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                ScriptedOp::Error(kind) => {
+                    Poll::Ready(Err(io::Error::new(kind, "scripted io error")))
+                }
+                ScriptedOp::Eof => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        fn clone(_: *const ()) -> RawWaker {
+            noop_raw_waker()
+        }
+        fn noop(_: *const ()) {}
+        fn noop_raw_waker() -> RawWaker {
+            RawWaker::new(
+                std::ptr::null(),
+                &RawWakerVTable::new(clone, noop, noop, noop),
+            )
+        }
+        unsafe { Waker::from_raw(noop_raw_waker()) }
+    }
+
+    fn poll_extend(mut reader: Pin<&mut BufReader<ScriptedRead>>) -> Poll<io::Result<usize>> {
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        unsafe {
+            let reader_ptr: *mut BufReader<ScriptedRead> = reader.as_mut().get_unchecked_mut();
+            if !(*reader_ptr).buf.has_remaining_mut() {
+                (*reader_ptr).buf.reserve(8 * 1024);
+            }
+            let mut initialized = vec![0u8; 8 * 1024];
+            let mut read_buf = tokio_dep::io::ReadBuf::new(&mut initialized);
+            let inner = reader.map_unchecked_mut(|reader| &mut reader.inner);
+            inner.poll_read(&mut context, &mut read_buf).map(|result| {
+                result.map(|()| {
+                    let filled = read_buf.filled();
+                    let len = filled.len();
+                    (*reader_ptr).buf.extend_from_slice(filled);
+                    len
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn two_consecutive_pending_polls_do_not_consume_data() {
+        let inner = ScriptedRead {
+            ops: std::collections::VecDeque::from([
+                ScriptedOp::Pending,
+                ScriptedOp::Pending,
+                ScriptedOp::Ready(vec![b'a']),
+            ]),
+            calls: 0,
+        };
+        let mut reader = BufReader::with_capacity(4, inner);
+        let mut reader = unsafe { Pin::new_unchecked(&mut reader) };
+
+        assert!(poll_extend(reader.as_mut()).is_pending());
+        assert!(poll_extend(reader.as_mut()).is_pending());
+        assert!(Bufferless.buffer(&*reader).is_empty());
+        assert_eq!(reader.get_ref().calls, 2);
+
+        match poll_extend(reader.as_mut()) {
+            Poll::Ready(Ok(1)) => {}
+            other => panic!(
+                "{}",
+                format!("expected one byte after pending, got {other:?}")
+            ),
+        }
+        assert_eq!(Bufferless.buffer(&*reader), b"a");
+        assert_eq!(reader.get_ref().calls, 3);
+    }
+
+    #[test]
+    fn bufferless_reader_preserves_bytes_split_inside_a_token() {
+        let inner = ScriptedRead {
+            ops: std::collections::VecDeque::from([
+                ScriptedOp::Ready(vec![0xf0]),
+                ScriptedOp::Ready(vec![0x9f]),
+                ScriptedOp::Ready(vec![0x98]),
+                ScriptedOp::Ready(vec![0x80]),
+            ]),
+            calls: 0,
+        };
+        let mut reader = BufReader::with_capacity(8, inner);
+        let mut reader = unsafe { Pin::new_unchecked(&mut reader) };
+
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(1))));
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(1))));
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(1))));
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(1))));
+        assert_eq!(Bufferless.buffer(&*reader), "😀".as_bytes());
+    }
+
+    #[test]
+    fn bufferless_reader_forwards_io_error() {
+        let inner = ScriptedRead {
+            ops: std::collections::VecDeque::from([ScriptedOp::Error(
+                io::ErrorKind::ConnectionReset,
+            )]),
+            calls: 0,
+        };
+        let mut reader = BufReader::with_capacity(4, inner);
+        let reader = unsafe { Pin::new_unchecked(&mut reader) };
+        match poll_extend(reader) {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset),
+            other => panic!("{}", format!("expected connection reset, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn polling_after_eof_keeps_returning_zero() {
+        let inner = ScriptedRead {
+            ops: std::collections::VecDeque::from([ScriptedOp::Eof, ScriptedOp::Eof]),
+            calls: 0,
+        };
+        let mut reader = BufReader::with_capacity(4, inner);
+        let mut reader = unsafe { Pin::new_unchecked(&mut reader) };
+
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(0))));
+        assert!(matches!(poll_extend(reader.as_mut()), Poll::Ready(Ok(0))));
+        assert!(Bufferless.buffer(&*reader).is_empty());
+        assert_eq!(reader.get_ref().calls, 2);
+    }
+}
